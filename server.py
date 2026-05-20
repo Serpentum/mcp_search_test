@@ -11,12 +11,14 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 
 import httpx
-from duckduckgo_search import DDGS
+from googlesearch import search as google_search
 from bs4 import BeautifulSoup
 import trafilatura
 
-MAX_TOOL_CALLS = 10
-_tool_call_count = 0
+MAX_SEARCH_CALLS = 2
+MAX_FETCH_CALLS = 5
+_search_call_count = 0
+_fetch_call_count = 0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +40,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-# --- URL Validation (T005) ---
+# --- URL Validation ---
 
 PRIVATE_RANGES = [
     ipaddress.ip_network("10.0.0.0/8"),
@@ -62,10 +64,8 @@ def is_private_or_blocked(host: str) -> bool:
         return any(ip in net for net in PRIVATE_RANGES)
     except ValueError:
         pass
-    # Check for localhost variants
     if "localhost" in host:
         return True
-    # Resolve hostname and check IPs
     try:
         addr_info = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
         for family, socktype, proto, canonname, sockaddr in addr_info:
@@ -88,7 +88,6 @@ def validate_url(url: str) -> str | None:
 
     url = url.strip()
 
-    # Check scheme
     if not (url.startswith("http://") or url.startswith("https://")):
         return f"Error: URL must start with http:// or https://. Got: {url}"
 
@@ -104,11 +103,11 @@ def validate_url(url: str) -> str | None:
     return None
 
 
-# --- web_search (T003) ---
+# --- web_search ---
 
 @app.tool()
 async def web_search(query: str) -> List[str]:
-    """Search the web via DuckDuckGo.
+    """Search the web via Google.
 
     Args:
         query: Search query string
@@ -116,11 +115,11 @@ async def web_search(query: str) -> List[str]:
     Returns:
         List of up to 5 search results (title, URL, snippet)
     """
-    global _tool_call_count
-    _tool_call_count += 1
-    if _tool_call_count > MAX_TOOL_CALLS:
-        logger.warning("Tool call limit reached (%d), shutting down", MAX_TOOL_CALLS)
-        sys.stderr.write(f"ERROR: Tool call limit reached ({MAX_TOOL_CALLS}).\n")
+    global _search_call_count
+    _search_call_count += 1
+    if _search_call_count > MAX_SEARCH_CALLS:
+        logger.warning("Search call limit reached (%d), shutting down", MAX_SEARCH_CALLS)
+        sys.stderr.write(f"ERROR: Search limit reached ({MAX_SEARCH_CALLS}). No more searches allowed.\n")
         sys.stderr.flush()
         os._exit(1)
 
@@ -128,26 +127,21 @@ async def web_search(query: str) -> List[str]:
         if not query or not query.strip():
             return ["Error: query parameter is required and cannot be empty."]
 
-        ddgs = DDGS()
-        results = list(ddgs.text(query.strip(), max_results=5))
+        results = list(google_search(query.strip(), num=5, stop=5, pause=2))
 
         if not results:
             return [f"No results found for query: {query}"]
 
         formatted_results = []
-        for i, result in enumerate(results, 1):
-            title = result.get("title", "No title")
-            url = result.get("href", "No URL")
-            snippet = result.get("body", "No snippet")
+        for i, url in enumerate(results, 1):
             formatted_results.append(
                 f"Result {i}:\n"
-                f"  Title: {title}\n"
                 f"  URL: {url}\n"
-                f"  Snippet: {snippet}\n"
+                f"  Snippet: Use fetch_url to read this page\n"
                 f"{'-' * 40}"
             )
 
-        logger.info("web_search: found %d results for '%s'", len(results), query)
+        logger.info("web_search: found %d results for '%s' (call %d/%d)", len(results), query, _search_call_count, MAX_SEARCH_CALLS)
         return formatted_results
 
     except Exception as e:
@@ -155,7 +149,7 @@ async def web_search(query: str) -> List[str]:
         return [f"Error searching for '{query}': {str(e)}"]
 
 
-# --- fetch_url (T004 + T006) ---
+# --- fetch_url ---
 
 @app.tool()
 async def fetch_url(url: str, format: str = "markdown") -> str:
@@ -168,16 +162,15 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     Returns:
         Page content in the specified format
     """
-    global _tool_call_count
-    _tool_call_count += 1
-    if _tool_call_count > MAX_TOOL_CALLS:
-        logger.warning("Tool call limit reached (%d), shutting down", MAX_TOOL_CALLS)
-        sys.stderr.write(f"ERROR: Tool call limit reached ({MAX_TOOL_CALLS}).\n")
+    global _fetch_call_count
+    _fetch_call_count += 1
+    if _fetch_call_count > MAX_FETCH_CALLS:
+        logger.warning("Fetch call limit reached (%d), shutting down", MAX_FETCH_CALLS)
+        sys.stderr.write(f"ERROR: Fetch limit reached ({MAX_FETCH_CALLS}). No more page reads allowed.\n")
         sys.stderr.flush()
         os._exit(1)
 
     try:
-        # Validate URL (T005)
         error = validate_url(url)
         if error:
             return error
@@ -204,7 +197,6 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
                 logger.info("fetch_url: returned raw HTML (%d chars) from %s", len(content), url)
                 return content
 
-            # markdown extraction
             try:
                 markdown = trafilatura.extract(
                     response.text,
@@ -215,7 +207,6 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
                 if markdown:
                     content = markdown[:10000]
                 else:
-                    # Fallback to bs4
                     soup = BeautifulSoup(response.text, "html.parser")
                     content = soup.get_text(separator="\n", strip=True)[:10000]
                     if not content.strip():
@@ -226,7 +217,7 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
                 if not content.strip():
                     content = f"Could not extract text content from {url}"
 
-        logger.info("fetch_url: extracted %d chars of markdown from %s", len(content), url)
+        logger.info("fetch_url: extracted %d chars from %s (call %d/%d)", len(content), url, _fetch_call_count, MAX_FETCH_CALLS)
         return content
 
     except httpx.RequestError as e:
