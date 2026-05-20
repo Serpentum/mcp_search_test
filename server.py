@@ -269,7 +269,7 @@ async def web_search(query: str) -> List[str]:
         return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_HARD}/{MAX_SEARCH_HARD}). Дальнейший поиск недоступен. Используйте已有的 результаты."]
 
     try:
-        results = list(google_search(query, num=5, stop=5, pause=2))
+        results = list(google_search(query, num_results=5))
 
         if not results:
             _tracker.record_call("search")
