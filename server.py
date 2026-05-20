@@ -8,13 +8,14 @@ import socket
 import json
 import ipaddress
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 from mcp.server.fastmcp import FastMCP
 
 import httpx
 from bs4 import BeautifulSoup
 import trafilatura
+from duckduckgo_search import DDGS
 
 # --- Environment Config ---
 MAX_SEARCH_SOFT = int(os.getenv("MCP_MAX_SEARCH_SOFT", "5"))
@@ -268,48 +269,13 @@ async def web_search(query: str) -> List[str]:
         return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_HARD}/{MAX_SEARCH_HARD}). Дальнейший поиск недоступен. Используйте已有的 результаты."]
 
     try:
-        google_url = f"https://www.google.com/search?q={httpx.URL(content=query).path}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-
-        async with httpx.AsyncClient(
-            timeout=10,
-            follow_redirects=True,
-            headers=headers,
-            verify=False
-        ) as client:
-            response = await client.get(google_url)
-            response.raise_for_status()
-            html = response.text
-
-        soup = BeautifulSoup(html, "html.parser")
         results = []
-        
-        for g in soup.find_all('div, li', class_=lambda x: x and ('ZINbbc' in x or 'yuRUbf' in x or 'MjvgIe' in x)):
-            link_el = g.find('a')
-            if link_el and link_el.get('href'):
-                url = link_el['href']
-                if '/url?q=' in url:
-                    url = url.split('/url?q=')[1].split('&')[0]
-                    title_el = g.find('h3')
-                    title = title_el.get_text(strip=True) if title_el else "No title"
-                    snippet_el = g.find('span', class_=lambda x: x and 'AOPqwk' in x)
-                    snippet = snippet_el.get_text(strip=True) if snippet_el else "No snippet"
-                    results.append((title, url, snippet))
-                    if len(results) >= 5:
-                        break
-
-        if not results:
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if '/url?q=' in href and not any(r[1] == href.split('/url?q=')[1].split('&')[0] for r in results):
-                    url = href.split('/url?q=')[1].split('&')[0]
-                    title = a.get_text(strip=True)
-                    if title and len(title) > 5 and not title.startswith('http'):
-                        results.append((title, url, "Use fetch_url to read this page"))
-                        if len(results) >= 5:
-                            break
+        with DDGS() as ddgs:
+            for item in ddgs.text(query, max_results=5):
+                title = item.get('title', 'No title')
+                url = item.get('href', '')
+                snippet = item.get('body', 'No snippet')
+                results.append((title, url, snippet))
 
         if not results:
             _tracker.record_call("search")
