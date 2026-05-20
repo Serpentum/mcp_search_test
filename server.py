@@ -4,6 +4,7 @@ import logging
 import sys
 import os
 import socket
+import json
 import ipaddress
 from typing import List
 from urllib.parse import urlparse
@@ -15,10 +16,9 @@ from googlesearch import search as google_search
 from bs4 import BeautifulSoup
 import trafilatura
 
+COUNTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tool_counters.json")
 MAX_SEARCH_CALLS = 2
 MAX_FETCH_CALLS = 5
-_search_call_count = 0
-_fetch_call_count = 0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,9 +30,31 @@ logger = logging.getLogger("web-tools-mcp")
 app = FastMCP("web-tools-mcp")
 
 
+def load_counters() -> dict:
+    if os.path.exists(COUNTER_FILE):
+        try:
+            with open(COUNTER_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"search": 0, "fetch": 0}
+
+
+def save_counters(counters: dict):
+    try:
+        with open(COUNTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(counters, f)
+    except IOError:
+        pass
+
+
+_counters = load_counters()
+
+
 async def signal_handler(signum, frame):
     sig_name = signal.Signals(signum).name
     logger.info("Received signal %s, shutting down...", sig_name)
+    save_counters(_counters)
     sys.exit(0)
 
 
@@ -82,7 +104,6 @@ def is_private_or_blocked(host: str) -> bool:
 
 
 def validate_url(url: str) -> str | None:
-    """Validate URL. Returns error message if invalid, None if valid."""
     if not url or not url.strip():
         return "Error: url parameter is required and cannot be empty."
 
@@ -107,7 +128,7 @@ def validate_url(url: str) -> str | None:
 
 @app.tool()
 async def web_search(query: str) -> List[str]:
-    """Search the web via Google.
+    """Search the web via Google. Максимум 2 поиска за сессию.
 
     Args:
         query: Search query string
@@ -115,13 +136,12 @@ async def web_search(query: str) -> List[str]:
     Returns:
         List of up to 5 search results (title, URL, snippet)
     """
-    global _search_call_count
-    _search_call_count += 1
-    if _search_call_count > MAX_SEARCH_CALLS:
-        logger.warning("Search call limit reached (%d), shutting down", MAX_SEARCH_CALLS)
-        sys.stderr.write(f"ERROR: Search limit reached ({MAX_SEARCH_CALLS}). No more searches allowed.\n")
-        sys.stderr.flush()
-        os._exit(1)
+    _counters["search"] = _counters.get("search", 0) + 1
+    save_counters(_counters)
+
+    if _counters["search"] > MAX_SEARCH_CALLS:
+        logger.warning("Search limit reached (%d/%d)", _counters["search"], MAX_SEARCH_CALLS)
+        return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_CALLS}/2). Дальнейший поиск невозможен. Используйте已有的 результаты."]
 
     try:
         if not query or not query.strip():
@@ -141,7 +161,7 @@ async def web_search(query: str) -> List[str]:
                 f"{'-' * 40}"
             )
 
-        logger.info("web_search: found %d results for '%s' (call %d/%d)", len(results), query, _search_call_count, MAX_SEARCH_CALLS)
+        logger.info("web_search: %d results (call %d/%d)", len(results), _counters["search"], MAX_SEARCH_CALLS)
         return formatted_results
 
     except Exception as e:
@@ -153,7 +173,7 @@ async def web_search(query: str) -> List[str]:
 
 @app.tool()
 async def fetch_url(url: str, format: str = "markdown") -> str:
-    """Fetch page content from a URL.
+    """Fetch page content from a URL. Максимум 5 чтений за сессию.
 
     Args:
         url: URL to fetch (http:// or https://)
@@ -162,13 +182,12 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     Returns:
         Page content in the specified format
     """
-    global _fetch_call_count
-    _fetch_call_count += 1
-    if _fetch_call_count > MAX_FETCH_CALLS:
-        logger.warning("Fetch call limit reached (%d), shutting down", MAX_FETCH_CALLS)
-        sys.stderr.write(f"ERROR: Fetch limit reached ({MAX_FETCH_CALLS}). No more page reads allowed.\n")
-        sys.stderr.flush()
-        os._exit(1)
+    _counters["fetch"] = _counters.get("fetch", 0) + 1
+    save_counters(_counters)
+
+    if _counters["fetch"] > MAX_FETCH_CALLS:
+        logger.warning("Fetch limit reached (%d/%d)", _counters["fetch"], MAX_FETCH_CALLS)
+        return f"ERROR: Лимит чтений исчерпан ({MAX_FETCH_CALLS}/5). Дальнейшее чтение невозможно. Используйте已有的 результаты."
 
     try:
         error = validate_url(url)
@@ -194,7 +213,7 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
 
             if fmt == "html":
                 content = response.text[:10000]
-                logger.info("fetch_url: returned raw HTML (%d chars) from %s", len(content), url)
+                logger.info("fetch_url: HTML %d chars (call %d/%d)", len(content), _counters["fetch"], MAX_FETCH_CALLS)
                 return content
 
             try:
@@ -217,7 +236,7 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
                 if not content.strip():
                     content = f"Could not extract text content from {url}"
 
-        logger.info("fetch_url: extracted %d chars from %s (call %d/%d)", len(content), url, _fetch_call_count, MAX_FETCH_CALLS)
+        logger.info("fetch_url: %d chars (call %d/%d)", len(content), _counters["fetch"], MAX_FETCH_CALLS)
         return content
 
     except httpx.RequestError as e:
