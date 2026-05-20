@@ -106,6 +106,11 @@ class SessionTracker:
         elif tool_type == "fetch":
             self.fetch_count += 1
 
+    def reset(self):
+        self.search_count = 0
+        self.fetch_count = 0
+        self.total_count = 0
+
     def get_progress(self) -> dict:
         return {
             "searches": self.search_count,
@@ -253,6 +258,8 @@ async def web_search(query: str) -> List[str]:
     Returns:
         List of up to 5 search results (title, URL, snippet)
     """
+    _tracker.reset()
+
     if not query or not query.strip():
         return ["Error: query parameter is required and cannot be empty."]
 
@@ -326,6 +333,8 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     Returns:
         Page content in the specified format
     """
+    _tracker.reset()
+
     error = validate_url(url)
     if error:
         return error
