@@ -14,6 +14,9 @@ from duckduckgo_search import DDGS
 from bs4 import BeautifulSoup
 import trafilatura
 
+MAX_TOOL_CALLS = 10
+_tool_call_count = 0
+
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stderr,
@@ -112,6 +115,11 @@ async def web_search(query: str) -> List[str]:
     Returns:
         List of up to 5 search results (title, URL, snippet)
     """
+    global _tool_call_count
+    _tool_call_count += 1
+    if _tool_call_count > MAX_TOOL_CALLS:
+        return [f"Error: Maximum tool calls limit reached ({MAX_TOOL_CALLS}). Stop searching."]
+
     try:
         if not query or not query.strip():
             return ["Error: query parameter is required and cannot be empty."]
@@ -156,6 +164,11 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     Returns:
         Page content in the specified format
     """
+    global _tool_call_count
+    _tool_call_count += 1
+    if _tool_call_count > MAX_TOOL_CALLS:
+        return f"Error: Maximum tool calls limit reached ({MAX_TOOL_CALLS}). Stop fetching."
+
     try:
         # Validate URL (T005)
         error = validate_url(url)
