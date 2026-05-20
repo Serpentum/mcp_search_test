@@ -3,6 +3,7 @@ import signal
 import logging
 import sys
 import os
+import time
 import socket
 import json
 import ipaddress
@@ -16,9 +17,14 @@ from googlesearch import search as google_search
 from bs4 import BeautifulSoup
 import trafilatura
 
-COUNTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tool_counters.json")
-MAX_SEARCH_CALLS = 2
-MAX_FETCH_CALLS = 5
+# --- Environment Config ---
+MAX_SEARCH_SOFT = int(os.getenv("MCP_MAX_SEARCH_SOFT", "5"))
+MAX_SEARCH_HARD = int(os.getenv("MCP_MAX_SEARCH_HARD", "7"))
+MAX_FETCH_SOFT = int(os.getenv("MCP_MAX_FETCH_SOFT", "8"))
+MAX_FETCH_HARD = int(os.getenv("MCP_MAX_FETCH_HARD", "10"))
+MAX_TOTAL_REQUESTS = int(os.getenv("MCP_MAX_TOTAL", "30"))
+CACHE_TTL_SECONDS = int(os.getenv("MCP_CACHE_TTL", "300"))
+CACHE_MAX_SIZE = int(os.getenv("MCP_CACHE_MAX_SIZE", "100"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,31 +36,142 @@ logger = logging.getLogger("web-tools-mcp")
 app = FastMCP("web-tools-mcp")
 
 
-def load_counters() -> dict:
-    if os.path.exists(COUNTER_FILE):
-        try:
-            with open(COUNTER_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {"search": 0, "fetch": 0}
+# --- Cache ---
+
+class _CacheEntry:
+    __slots__ = ("value", "created_at")
+
+    def __init__(self, value, created_at: float):
+        self.value = value
+        self.created_at = created_at
 
 
-def save_counters(counters: dict):
-    try:
-        with open(COUNTER_FILE, "w", encoding="utf-8") as f:
-            json.dump(counters, f)
-    except IOError:
-        pass
+class _Cache:
+    def __init__(self, ttl: int = CACHE_TTL_SECONDS, max_size: int = CACHE_MAX_SIZE):
+        self._store: dict[str, _CacheEntry] = {}
+        self._order: list[str] = []
+        self.ttl = ttl
+        self.max_size = max_size
+
+    def get(self, key: str):
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if time.time() - entry.created_at > self.ttl:
+            self._remove(key)
+            return None
+        return entry.value
+
+    def put(self, key: str, value):
+        if key in self._store:
+            self._remove(key)
+        if len(self._store) >= self.max_size:
+            self._evict()
+        self._store[key] = _CacheEntry(value, time.time())
+        self._order.append(key)
+
+    def _remove(self, key: str):
+        self._store.pop(key, None)
+        if key in self._order:
+            self._order.remove(key)
+
+    def _evict(self):
+        if self._order:
+            oldest = self._order.pop(0)
+            self._store.pop(oldest, None)
 
 
-_counters = load_counters()
+# --- Session Tracker ---
+
+class SessionTracker:
+    def __init__(self):
+        self.search_count = 0
+        self.fetch_count = 0
+        self.total_count = 0
+        self.cache = _Cache()
+
+    def can_call(self, tool_type: str) -> bool:
+        if self.total_count >= MAX_TOTAL_REQUESTS:
+            return False
+        if tool_type == "search":
+            return self.search_count < MAX_SEARCH_HARD
+        if tool_type == "fetch":
+            return self.fetch_count < MAX_FETCH_HARD
+        return True
+
+    def record_call(self, tool_type: str):
+        self.total_count += 1
+        if tool_type == "search":
+            self.search_count += 1
+        elif tool_type == "fetch":
+            self.fetch_count += 1
+
+    def get_progress(self) -> dict:
+        return {
+            "searches": self.search_count,
+            "searches_soft": MAX_SEARCH_SOFT,
+            "searches_hard": MAX_SEARCH_HARD,
+            "fetches": self.fetch_count,
+            "fetches_soft": MAX_FETCH_SOFT,
+            "fetches_hard": MAX_FETCH_HARD,
+            "total": self.total_count,
+            "total_hard": MAX_TOTAL_REQUESTS,
+            "remaining_searches": max(0, MAX_SEARCH_HARD - self.search_count),
+            "remaining_fetches": max(0, MAX_FETCH_HARD - self.fetch_count),
+            "remaining_total": max(0, MAX_TOTAL_REQUESTS - self.total_count),
+        }
+
+    def get_search_advisory(self) -> str | None:
+        if self.search_count >= MAX_SEARCH_HARD:
+            return None
+        if self.search_count >= MAX_SEARCH_SOFT:
+            remaining = MAX_SEARCH_HARD - self.search_count
+            if remaining == 1:
+                return (
+                    "\n---\n"
+                    "⚠️ Достигнут мягкий лимит поисков (5/7).\n"
+                    "Пожалуйста, завершите поиск и перейдите к суммаризации найденных данных.\n"
+                    "Прочитайте найденные страницы через fetch_url для углубления в тему."
+                )
+            else:
+                return (
+                    "\n---\n"
+                    f"⚠️ Достигнут мягкий лимит поисков ({self.search_count}/{MAX_SEARCH_HARD}).\n"
+                    f"Рекомендую: 1) Прочитать найденные страницы через fetch_url 2) "
+                    f"Сформировать ответ на основе имеющихся данных"
+                )
+        return None
+
+    def get_fetch_advisory(self) -> str | None:
+        if self.fetch_count >= MAX_FETCH_HARD:
+            return None
+        if self.fetch_count >= MAX_FETCH_SOFT:
+            return (
+                "\n---\n"
+                f"⚠️ Достигнут мягкий лимит чтений ({self.fetch_count}/{MAX_FETCH_HARD}).\n"
+                "Пожалуйста, завершите чтение и сформируйте ответ на основе имеющихся данных."
+            )
+        return None
+
+    def get_progress_banner(self) -> str:
+        p = self.get_progress()
+        return (
+            f"\n---\n"
+            f"📊 Прогресс: поиски {p['searches']}/{p['searches_hard']}, "
+            f"чтения {p['fetches']}/{p['fetches_hard']}, "
+            f"всего {p['total']}/{p['total_hard']}\n"
+            f"Осталось: {p['remaining_searches']} поисков, "
+            f"{p['remaining_fetches']} чтений, "
+            f"{p['remaining_total']} всего"
+        )
+
+
+_tracker = SessionTracker()
 
 
 async def signal_handler(signum, frame):
     sig_name = signal.Signals(signum).name
     logger.info("Received signal %s, shutting down...", sig_name)
-    save_counters(_counters)
     sys.exit(0)
 
 
@@ -128,7 +245,7 @@ def validate_url(url: str) -> str | None:
 
 @app.tool()
 async def web_search(query: str) -> List[str]:
-    """Search the web via Google. Максимум 2 поиска за сессию.
+    """Search the web via Google. Soft limit: 5, Hard limit: 7 per session.
 
     Args:
         query: Search query string
@@ -136,21 +253,32 @@ async def web_search(query: str) -> List[str]:
     Returns:
         List of up to 5 search results (title, URL, snippet)
     """
-    _counters["search"] = _counters.get("search", 0) + 1
-    save_counters(_counters)
+    if not query or not query.strip():
+        return ["Error: query parameter is required and cannot be empty."]
 
-    if _counters["search"] > MAX_SEARCH_CALLS:
-        logger.warning("Search limit reached (%d/%d)", _counters["search"], MAX_SEARCH_CALLS)
-        return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_CALLS}/2). Дальнейший поиск невозможен. Используйте已有的 результаты."]
+    query = query.strip()
+
+    cached = _tracker.cache.get(f"search:{query}")
+    if cached is not None:
+        logger.info("web_search: cache hit for '%s'", query)
+        banner = _tracker.get_progress_banner()
+        return [*cached, banner]
+
+    if not _tracker.can_call("search"):
+        logger.warning("Search hard limit reached (%d/%d)", _tracker.search_count, MAX_SEARCH_HARD)
+        return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_HARD}/{MAX_SEARCH_HARD}). Дальнейший поиск недоступен. Используйте已有的 результаты."]
 
     try:
-        if not query or not query.strip():
-            return ["Error: query parameter is required and cannot be empty."]
-
-        results = list(google_search(query.strip(), num=5, stop=5, pause=2))
+        results = list(google_search(query, num=5, stop=5, pause=2))
 
         if not results:
-            return [f"No results found for query: {query}"]
+            _tracker.record_call("search")
+            banner = _tracker.get_progress_banner()
+            advisory = _tracker.get_search_advisory()
+            msg = f"No results found for query: {query}"
+            if advisory:
+                return [msg, advisory]
+            return [msg, banner]
 
         formatted_results = []
         for i, url in enumerate(results, 1):
@@ -161,8 +289,17 @@ async def web_search(query: str) -> List[str]:
                 f"{'-' * 40}"
             )
 
-        logger.info("web_search: %d results (call %d/%d)", len(results), _counters["search"], MAX_SEARCH_CALLS)
-        return formatted_results
+        _tracker.record_call("search")
+        _tracker.cache.put(f"search:{query}", formatted_results)
+
+        logger.info("web_search: %d results (call %d/%d)", len(results), _tracker.search_count, MAX_SEARCH_HARD)
+
+        banner = _tracker.get_progress_banner()
+        advisory = _tracker.get_search_advisory()
+
+        if advisory:
+            return [*formatted_results, advisory]
+        return [*formatted_results, banner]
 
     except Exception as e:
         logger.error("web_search error: %s", str(e), exc_info=True)
@@ -173,7 +310,7 @@ async def web_search(query: str) -> List[str]:
 
 @app.tool()
 async def fetch_url(url: str, format: str = "markdown") -> str:
-    """Fetch page content from a URL. Максимум 5 чтений за сессию.
+    """Fetch page content from a URL. Soft limit: 8, Hard limit: 10 per session.
 
     Args:
         url: URL to fetch (http:// or https://)
@@ -182,22 +319,25 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     Returns:
         Page content in the specified format
     """
-    _counters["fetch"] = _counters.get("fetch", 0) + 1
-    save_counters(_counters)
+    error = validate_url(url)
+    if error:
+        return error
 
-    if _counters["fetch"] > MAX_FETCH_CALLS:
-        logger.warning("Fetch limit reached (%d/%d)", _counters["fetch"], MAX_FETCH_CALLS)
-        return f"ERROR: Лимит чтений исчерпан ({MAX_FETCH_CALLS}/5). Дальнейшее чтение невозможно. Используйте已有的 результаты."
+    fmt = format.lower() if format else "markdown"
+    if fmt not in ("markdown", "html"):
+        return f"Error: format must be 'markdown' or 'html'. Got: {format}"
+
+    cached = _tracker.cache.get(f"fetch:{url}:{fmt}")
+    if cached is not None:
+        logger.info("fetch_url: cache hit for '%s' (%s)", url, fmt)
+        banner = _tracker.get_progress_banner()
+        return f"{cached}\n{banner}"
+
+    if not _tracker.can_call("fetch"):
+        logger.warning("Fetch hard limit reached (%d/%d)", _tracker.fetch_count, MAX_FETCH_HARD)
+        return f"ERROR: Лимит чтений исчерпан ({MAX_FETCH_HARD}/{MAX_FETCH_HARD}). Дальнейшее чтение невозможно. Используйте已有的 результаты."
 
     try:
-        error = validate_url(url)
-        if error:
-            return error
-
-        fmt = format.lower() if format else "markdown"
-        if fmt not in ("markdown", "html"):
-            return f"Error: format must be 'markdown' or 'html'. Got: {format}"
-
         headers = {
             "User-Agent": "WebToolsMCP/1.0 (AI Assistant Tool)"
         }
@@ -213,8 +353,15 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
 
             if fmt == "html":
                 content = response.text[:10000]
-                logger.info("fetch_url: HTML %d chars (call %d/%d)", len(content), _counters["fetch"], MAX_FETCH_CALLS)
-                return content
+                _tracker.record_call("fetch")
+                _tracker.cache.put(f"fetch:{url}:{fmt}", content)
+                logger.info("fetch_url: HTML %d chars (call %d/%d)", len(content), _tracker.fetch_count, MAX_FETCH_HARD)
+                banner = _tracker.get_progress_banner()
+                advisory = _tracker.get_fetch_advisory()
+                result = f"{content}\n{banner}"
+                if advisory:
+                    result = f"{content}\n{advisory}"
+                return result
 
             try:
                 markdown = trafilatura.extract(
@@ -236,8 +383,16 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
                 if not content.strip():
                     content = f"Could not extract text content from {url}"
 
-        logger.info("fetch_url: %d chars (call %d/%d)", len(content), _counters["fetch"], MAX_FETCH_CALLS)
-        return content
+        _tracker.record_call("fetch")
+        _tracker.cache.put(f"fetch:{url}:{fmt}", content)
+        logger.info("fetch_url: %d chars (call %d/%d)", len(content), _tracker.fetch_count, MAX_FETCH_HARD)
+
+        banner = _tracker.get_progress_banner()
+        advisory = _tracker.get_fetch_advisory()
+
+        if advisory:
+            return f"{content}\n{advisory}"
+        return f"{content}\n{banner}"
 
     except httpx.RequestError as e:
         logger.error("fetch_url network error: %s", str(e), exc_info=True)
