@@ -2,6 +2,7 @@
 import signal
 import logging
 import sys
+import os
 import socket
 import ipaddress
 from typing import List
@@ -118,7 +119,10 @@ async def web_search(query: str) -> List[str]:
     global _tool_call_count
     _tool_call_count += 1
     if _tool_call_count > MAX_TOOL_CALLS:
-        return [f"Error: Maximum tool calls limit reached ({MAX_TOOL_CALLS}). Stop searching."]
+        logger.warning("Tool call limit reached (%d), shutting down", MAX_TOOL_CALLS)
+        sys.stderr.write(f"ERROR: Tool call limit reached ({MAX_TOOL_CALLS}).\n")
+        sys.stderr.flush()
+        os._exit(1)
 
     try:
         if not query or not query.strip():
@@ -167,7 +171,10 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     global _tool_call_count
     _tool_call_count += 1
     if _tool_call_count > MAX_TOOL_CALLS:
-        return f"Error: Maximum tool calls limit reached ({MAX_TOOL_CALLS}). Stop fetching."
+        logger.warning("Tool call limit reached (%d), shutting down", MAX_TOOL_CALLS)
+        sys.stderr.write(f"ERROR: Tool call limit reached ({MAX_TOOL_CALLS}).\n")
+        sys.stderr.flush()
+        os._exit(1)
 
     try:
         # Validate URL (T005)
