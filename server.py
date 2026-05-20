@@ -258,8 +258,6 @@ async def web_search(query: str) -> List[str]:
     Returns:
         List of up to 5 search results (title, URL, snippet)
     """
-    _tracker.reset()
-
     if not query or not query.strip():
         return ["Error: query parameter is required and cannot be empty."]
 
@@ -333,8 +331,6 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     Returns:
         Page content in the specified format
     """
-    _tracker.reset()
-
     error = validate_url(url)
     if error:
         return error
@@ -419,6 +415,23 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     except Exception as e:
         logger.error("fetch_url error: %s", str(e), exc_info=True)
         return f"Error fetching '{url}': {str(e)}"
+
+
+@app.tool()
+def reset_limits() -> str:
+    """Reset all search and fetch counters. Use when starting a new task or conversation.
+
+    Returns:
+        Confirmation message with current limits
+    """
+    _tracker.reset()
+    logger.info("Limits reset by user")
+    return (
+        f"Лимиты сброшены.\n"
+        f"Поиски: {MAX_SEARCH_SOFT} (мягкий) / {MAX_SEARCH_HARD} (жёсткий)\n"
+        f"Чтения: {MAX_FETCH_SOFT} (мягкий) / {MAX_FETCH_HARD} (жёсткий)\n"
+        f"Всего: {MAX_TOTAL_REQUESTS}"
+    )
 
 
 if __name__ == "__main__":
