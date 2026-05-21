@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 import httpx
 from bs4 import BeautifulSoup
 import trafilatura
-from brave import AsyncBrave
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 # --- Environment Config ---
 MAX_SEARCH_SOFT = int(os.getenv("MCP_MAX_SEARCH_SOFT", "5"))
@@ -26,6 +26,7 @@ MAX_TOTAL_REQUESTS = int(os.getenv("MCP_MAX_TOTAL", "30"))
 CACHE_TTL_SECONDS = int(os.getenv("MCP_CACHE_TTL", "300"))
 CACHE_MAX_SIZE = int(os.getenv("MCP_CACHE_MAX_SIZE", "100"))
 UNSAFE_MODE = os.getenv("MCP_UNSAFE_MODE", "false").lower() == "true"
+BROWSER_TIMEOUT = int(os.getenv("MCP_BROWSER_TIMEOUT", "15000"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -175,89 +176,261 @@ class SessionTracker:
 _tracker = SessionTracker()
 
 
-async def signal_handler(signum, frame):
-    sig_name = signal.Signals(signum).name
-    logger.info("Received signal %s, shutting down...", sig_name)
-    sys.exit(0)
+# --- Browser Manager ---
+
+class _BrowserManager:
+    def __init__(self):
+        self._playwright = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._lock = asyncio.Lock()
+        self._initialized = False
+
+    async def init(self):
+        async with self._lock:
+            if self._initialized:
+                return
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.firefox.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            self._context = await self._browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="ru-RU",
+            )
+            self._context.set_default_timeout(BROWSER_TIMEOUT)
+            self._initialized = True
+            logger.info("Playwright browser (firefox) initialized")
+
+    async def new_page(self) -> Page:
+        if not self._initialized:
+            await self.init()
+        return await self._context.new_page()
+
+    async def close(self):
+        async with self._lock:
+            if self._browser:
+                await self._browser.close()
+            if self._playwright:
+                await self._playwright.stop()
+            self._initialized = False
+            logger.info("Playwright browser closed")
 
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+_browser = _BrowserManager()
 
 
-# --- URL Validation ---
+# --- Search Engines ---
 
-PRIVATE_RANGES = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-
-
-def is_private_or_blocked(host: str) -> bool:
-    if UNSAFE_MODE:
-        return False
-    host = host.strip().lower()
-    if host in ("localhost", "127.0.0.1", "0.0.0.0"):
-        return True
+async def _parse_yandex(page: Page, query: str) -> list[tuple[str, str, str]]:
+    """Search via Yandex."""
+    url = f"https://yandex.ru/search/?text={quote_plus(query)}"
+    logger.info("yandex: navigating to %s", url)
     try:
-        ip = ipaddress.ip_address(host)
-        return any(ip in net for net in PRIVATE_RANGES)
-    except ValueError:
-        pass
-    if "localhost" in host:
-        return True
+        await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+        await page.wait_for_selector(".serp-item", timeout=10000).catch(lambda: None)
+    except Exception as e:
+        logger.warning("yandex: navigation error: %s", str(e))
+        return []
+
+    results = await page.evaluate("""() => {
+        const items = document.querySelectorAll('.serp-item');
+        const results = [];
+        for (const item of items) {
+            const titleEl = item.querySelector('.serp-item__title a, a[href]');
+            const linkEl = item.querySelector('.path__text, .link');
+            const snippetEl = item.querySelector('.serp-item__text, .serp-item__snippet, .organic__text');
+            if (titleEl && titleEl.href) {
+                results.push({
+                    title: titleEl.textContent.trim(),
+                    url: titleEl.href,
+                    snippet: snippetEl ? snippetEl.textContent.trim() : ''
+                });
+            }
+        }
+        return results.slice(0, 5);
+    }""")
+
+    parsed = []
+    for r in results:
+        title = r.get("title", "").strip()
+        url = r.get("url", "").strip()
+        snippet = r.get("snippet", "").strip()
+        if title and url:
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                url = "https://yandex.ru" + url
+            parsed.append((title, url, snippet))
+    return parsed
+
+
+async def _parse_google(page: Page, query: str) -> list[tuple[str, str, str]]:
+    """Search via Google."""
+    url = f"https://www.google.com/search?q={quote_plus(query)}&hl=ru&num=5"
+    logger.info("google: navigating to %s", url)
     try:
-        addr_info = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-        for family, socktype, proto, canonname, sockaddr in addr_info:
-            ip_str = sockaddr[0]
+        await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+        await page.wait_for_selector('div.g a, div.MjjYud a', timeout=10000).catch(lambda: None)
+    except Exception as e:
+        logger.warning("google: navigation error: %s", str(e))
+        return []
+
+    results = await page.evaluate("""() => {
+        const items = document.querySelectorAll('div.g a, div.MjjYud a');
+        const results = [];
+        const seen = new Set();
+        for (const item of items) {
+            const href = item.href || '';
+            if (href && !href.includes('google.') && !seen.has(href)) {
+                seen.add(href);
+                const title = item.textContent.trim();
+                const parent = item.closest('div');
+                const snippet = parent ? parent.querySelector('span[style]')?.textContent.trim() || '' : '';
+                results.push({ title: title, url: href, snippet: snippet });
+                if (results.length >= 5) break;
+            }
+        }
+        return results;
+    }""")
+
+    parsed = []
+    for r in results:
+        title = r.get("title", "").strip()
+        url = r.get("url", "").strip()
+        snippet = r.get("snippet", "").strip()
+        if title and url:
+            parsed.append((title, url, snippet))
+    return parsed
+
+
+async def _parse_bing(page: Page, query: str) -> list[tuple[str, str, str]]:
+    """Search via Bing."""
+    url = f"https://www.bing.com/search?q={quote_plus(query)}&setlang=ru&count=5"
+    logger.info("bing: navigating to %s", url)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+        await page.wait_for_selector('ol#b_results li.b_algo, .b_algo', timeout=10000).catch(lambda: None)
+    except Exception as e:
+        logger.warning("bing: navigation error: %s", str(e))
+        return []
+
+    results = await page.evaluate("""() => {
+        const items = document.querySelectorAll('.b_algo');
+        const results = [];
+        for (const item of items) {
+            const titleEl = item.querySelector('h2 a');
+            const snippetEl = item.querySelector('.b_caption p, p');
+            if (titleEl && titleEl.href) {
+                results.push({
+                    title: titleEl.textContent.trim(),
+                    url: titleEl.href,
+                    snippet: snippetEl ? snippetEl.textContent.trim() : ''
+                });
+            }
+        }
+        return results.slice(0, 5);
+    }""")
+
+    parsed = []
+    for r in results:
+        title = r.get("title", "").strip()
+        url = r.get("url", "").strip()
+        snippet = r.get("snippet", "").strip()
+        if title and url:
+            if url.startswith("//"):
+                url = "https:" + url
+            parsed.append((title, url, snippet))
+    return parsed
+
+
+async def _parse_rambler(page: Page, query: str) -> list[tuple[str, str, str]]:
+    """Search via Rambler."""
+    url = f"https://search.rambler.ru/search?query={quote_plus(query)}"
+    logger.info("rambler: navigating to %s", url)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+        await page.wait_for_selector('.result, .item', timeout=10000).catch(lambda: None)
+    except Exception as e:
+        logger.warning("rambler: navigation error: %s", str(e))
+        return []
+
+    results = await page.evaluate("""() => {
+        const items = document.querySelectorAll('.result');
+        const results = [];
+        for (const item of items) {
+            const titleEl = item.querySelector('.result__title__link, a[href]');
+            const snippetEl = item.querySelector('.result__snippet, .item__text, .snippet');
+            if (titleEl && titleEl.href) {
+                results.push({
+                    title: titleEl.textContent.trim(),
+                    url: titleEl.href,
+                    snippet: snippetEl ? snippetEl.textContent.trim() : ''
+                });
+            }
+        }
+        return results.slice(0, 5);
+    }""")
+
+    parsed = []
+    for r in results:
+        title = r.get("title", "").strip()
+        url = r.get("url", "").strip()
+        snippet = r.get("snippet", "").strip()
+        if title and url:
+            if url.startswith("//"):
+                url = "https:" + url
+            parsed.append((title, url, snippet))
+    return parsed
+
+
+# --- Search Fallback Chain ---
+
+async def _search_with_fallback(query: str) -> list[tuple[str, str, str]]:
+    """Try search engines in order: Yandex -> Google -> Bing -> Rambler."""
+    engines = [
+        ("yandex", _parse_yandex),
+        ("google", _parse_google),
+        ("bing", _parse_bing),
+        ("rambler", _parse_rambler),
+    ]
+
+    for name, engine_fn in engines:
+        try:
+            page = await _browser.new_page()
+            results = await engine_fn(page, query)
+            await page.close()
+            if results:
+                logger.info("search: %s returned %d results", name, len(results))
+                return results
+            logger.info("search: %s returned 0 results, trying next engine", name)
+        except Exception as e:
+            logger.warning("search: %s failed: %s", name, str(e))
             try:
-                ip_obj = ipaddress.ip_address(ip_str)
-                if any(ip_obj in net for net in PRIVATE_RANGES):
-                    return True
-            except ValueError:
-                continue
-    except socket.gaierror:
-        pass
-    return False
+                await page.close()
+            except Exception:
+                pass
 
-
-def validate_url(url: str) -> str | None:
-    if not url or not url.strip():
-        return "Error: url parameter is required and cannot be empty."
-
-    url = url.strip()
-
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return f"Error: URL must start with http:// or https://. Got: {url}"
-
-    parsed = urlparse(url)
-    host = parsed.hostname
-
-    if not host:
-        return f"Error: Could not extract hostname from URL: {url}"
-
-    if is_private_or_blocked(host):
-        return f"Error: Access to '{host}' is blocked for security reasons (private IP or localhost)."
-
-    return None
+    logger.warning("search: all engines failed for query '%s'", query)
+    return []
 
 
 # --- web_search ---
 
 @app.tool()
 async def web_search(query: str) -> List[str]:
-    """Search the web via Google. Soft limit: 5, Hard limit: 7 per session.
-
+    """Search the web via search engines (Yandex, Google, Bing, Rambler).
+    Soft limit: 5, Hard limit: 7 per session.
+    
     Args:
         query: Search query string
-
+        
     Returns:
         List of up to 5 search results (title, URL, snippet)
     """
@@ -277,14 +450,7 @@ async def web_search(query: str) -> List[str]:
         return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_HARD}/{MAX_SEARCH_HARD}). Дальнейший поиск недоступен. Используйте已有的 результаты."]
 
     try:
-        results = []
-        brave = AsyncBrave()
-        search_results = await brave.search(q=query, count=5)
-        for item in search_results.web_results:
-            title = item.title or 'No title'
-            url = item.url or ''
-            snippet = item.description or 'No snippet'
-            results.append((title, url, snippet))
+        results = await _search_with_fallback(query)
 
         if not results:
             _tracker.record_call("search")
@@ -327,11 +493,11 @@ async def web_search(query: str) -> List[str]:
 @app.tool()
 async def fetch_url(url: str, format: str = "markdown") -> str:
     """Fetch page content from a URL. Soft limit: 8, Hard limit: 10 per session.
-
+    
     Args:
         url: URL to fetch (http:// or https://)
         format: Output format - "markdown" (default) or "html"
-
+        
     Returns:
         Page content in the specified format
     """
@@ -424,7 +590,7 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
 @app.tool()
 def reset_limits() -> str:
     """Reset all search and fetch counters. Use when starting a new task or conversation.
-
+    
     Returns:
         Confirmation message with current limits
     """
@@ -438,5 +604,77 @@ def reset_limits() -> str:
     )
 
 
+# --- URL Validation ---
+
+PRIVATE_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def is_private_or_blocked(host: str) -> bool:
+    if UNSAFE_MODE:
+        return False
+    host = host.strip().lower()
+    if host in ("localhost", "127.0.0.1", "0.0.0.0"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return any(ip in net for net in PRIVATE_RANGES)
+    except ValueError:
+        pass
+    if "localhost" in host:
+        return True
+    try:
+        addr_info = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        for family, socktype, proto, canonname, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            try:
+                ip_obj = ipaddress.ip_address(ip_str)
+                if any(ip_obj in net for net in PRIVATE_RANGES):
+                    return True
+            except ValueError:
+                continue
+    except socket.gaierror:
+        pass
+    return False
+
+
+def validate_url(url: str) -> str | None:
+    if not url or not url.strip():
+        return "Error: url parameter is required and cannot be empty."
+
+    url = url.strip()
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return f"Error: URL must start with http:// or https://. Got: {url}"
+
+    parsed = urlparse(url)
+    host = parsed.hostname
+
+    if not host:
+        return f"Error: Could not extract hostname from URL: {url}"
+
+    if is_private_or_blocked(host):
+        return f"Error: Access to '{host}' is blocked for security reasons (private IP or localhost)."
+
+    return None
+
+
 if __name__ == "__main__":
-    asyncio.run(app.run_stdio_async())
+    async def main():
+        try:
+            await app.run_stdio_async()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await _browser.close()
+
+    asyncio.run(main())
