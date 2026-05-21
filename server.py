@@ -25,6 +25,7 @@ MAX_FETCH_HARD = int(os.getenv("MCP_MAX_FETCH_HARD", "10"))
 MAX_TOTAL_REQUESTS = int(os.getenv("MCP_MAX_TOTAL", "30"))
 CACHE_TTL_SECONDS = int(os.getenv("MCP_CACHE_TTL", "300"))
 CACHE_MAX_SIZE = int(os.getenv("MCP_CACHE_MAX_SIZE", "100"))
+UNSAFE_MODE = os.getenv("MCP_UNSAFE_MODE", "false").lower() == "true"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -200,6 +201,8 @@ PRIVATE_RANGES = [
 
 
 def is_private_or_blocked(host: str) -> bool:
+    if UNSAFE_MODE:
+        return False
     host = host.strip().lower()
     if host in ("localhost", "127.0.0.1", "0.0.0.0"):
         return True
