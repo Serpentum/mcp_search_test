@@ -234,7 +234,10 @@ async def _parse_yandex(page: Page, query: str) -> list[tuple[str, str, str]]:
     logger.info("yandex: navigating to %s", url)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
-        await page.wait_for_selector(".serp-item", timeout=10000).catch(lambda: None)
+        try:
+            await page.wait_for_selector(".serp-item", timeout=10000)
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("yandex: navigation error: %s", str(e))
         return []
@@ -277,7 +280,10 @@ async def _parse_google(page: Page, query: str) -> list[tuple[str, str, str]]:
     logger.info("google: navigating to %s", url)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
-        await page.wait_for_selector('div.g a, div.MjjYud a', timeout=10000).catch(lambda: None)
+        try:
+            await page.wait_for_selector("div.g", timeout=10000)
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("google: navigation error: %s", str(e))
         return []
@@ -316,7 +322,10 @@ async def _parse_bing(page: Page, query: str) -> list[tuple[str, str, str]]:
     logger.info("bing: navigating to %s", url)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
-        await page.wait_for_selector('ol#b_results li.b_algo, .b_algo', timeout=10000).catch(lambda: None)
+        try:
+            await page.wait_for_selector(".b_algo", timeout=10000)
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("bing: navigation error: %s", str(e))
         return []
@@ -356,7 +365,10 @@ async def _parse_rambler(page: Page, query: str) -> list[tuple[str, str, str]]:
     logger.info("rambler: navigating to %s", url)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
-        await page.wait_for_selector('.result, .item', timeout=10000).catch(lambda: None)
+        try:
+            await page.wait_for_selector(".result", timeout=10000)
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("rambler: navigation error: %s", str(e))
         return []
