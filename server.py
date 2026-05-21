@@ -1,4 +1,6 @@
-﻿import asyncio
+﻿from __future__ import annotations
+
+import asyncio
 import signal
 import logging
 import sys
@@ -179,6 +181,10 @@ class _Cache:
         if self._order:
             oldest = self._order.pop(0)
             self._store.pop(oldest, None)
+
+    def clear(self):
+        self._store.clear()
+        self._order.clear()
 
 
 # --- Session Tracker ---
@@ -562,7 +568,7 @@ async def reset_session() -> List[str]:
         Confirmation message with reset counters
     """
     _tracker.reset()
-    cache.clear()
+    _tracker.cache.clear()
     logger.info("Session reset: all counters and cache cleared")
     return ["Session reset: search_count=0, fetch_count=0, total_count=0, cache cleared"]
 
