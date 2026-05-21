@@ -104,15 +104,19 @@ def semantic_cache_get(cache: _Cache, key: str, fallback_keys: Optional[List[str
     if fallback_keys:
         for fk in fallback_keys:
             cached_key = None
+            best_match_query = None
+            best_match_score = 0.0
             for stored_key in list(cache._store.keys()):
                 if stored_key.startswith("search:"):
                     stored_query = stored_key[len("search:"):]
-                    if semantic_similarity(stored_query, fk) >= SEMANTIC_CACHE_THRESHOLD:
+                    score = semantic_similarity(stored_query, fk)
+                    if score >= SEMANTIC_CACHE_THRESHOLD:
                         cached_key = stored_key
+                        best_match_query = stored_query
+                        best_match_score = score
                         break
             if cached_key:
-                logger.info("Semantic cache hit: '%s' matched '%s' (score=%.2f)", fk, stored_query,
-                            semantic_similarity(stored_query, fk))
+                logger.info("Semantic cache hit: '%s' matched '%s' (score=%.2f)", fk, best_match_query, best_match_score)
                 return cache._store[cached_key].value
     return None
 
@@ -401,6 +405,7 @@ async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
 
     all_results = []
     seen_urls = set()
+    lock = asyncio.Lock()
     early_stop = asyncio.Event()
 
     async def run_engine(engine_key: str) -> list[tuple[str, str, str]]:
@@ -411,15 +416,9 @@ async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
             results = await engine_func(page, query)
             if results:
                 logger.info("%s (lang=%s) returned %d results", engine_name, lang, len(results))
-
-                for title, url, snippet in results:
-                    if url not in seen_urls:
-                        seen_urls.add(url)
-                        all_results.append((title, url, snippet))
-
-                if len(all_results) >= EARLY_TERMINATION_THRESHOLD:
-                    logger.info("Early termination: %d results collected", len(all_results))
-                    early_stop.set()
+                return results
+        except asyncio.CancelledError:
+            logger.info("%s cancelled (early termination)", engine_name)
         except Exception as e:
             logger.warning("%s search failed: %s", engine_name, str(e))
         finally:
@@ -429,9 +428,23 @@ async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
                 pass
         return []
 
-    tasks = [run_engine(engine_key) for engine_key in engine_order]
-    await asyncio.gather(*tasks)
+    tasks = {engine_key: asyncio.create_task(run_engine(engine_key)) for engine_key in engine_order}
+    for done in asyncio.as_completed(tasks.values()):
+        results = await done
+        if results:
+            async with lock:
+                for title, url, snippet in results:
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        all_results.append((title, url, snippet))
+                if len(all_results) >= EARLY_TERMINATION_THRESHOLD:
+                    logger.info("Early termination: %d results collected", len(all_results))
+                    early_stop.set()
+                    for t in tasks.values():
+                        t.cancel()
+                    break
 
+    await asyncio.gather(*tasks.values(), return_exceptions=True)
     return all_results
 
 
@@ -549,8 +562,9 @@ async def reset_session() -> List[str]:
         Confirmation message with reset counters
     """
     _tracker.reset()
-    logger.info("Session reset: all counters cleared")
-    return ["Session reset: search_count=0, fetch_count=0, total_count=0"]
+    cache.clear()
+    logger.info("Session reset: all counters and cache cleared")
+    return ["Session reset: search_count=0, fetch_count=0, total_count=0, cache cleared"]
 
 
 # --- fetch_url ---
