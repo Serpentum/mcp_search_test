@@ -58,6 +58,8 @@ EARLY_TERMINATION_THRESHOLD = int(os.getenv("MCP_EARLY_TERM", "8"))
 BATCH_FETCH_SIZE = int(os.getenv("MCP_BATCH_FETCH", "4"))
 SMART_FETCH_TOP_N = int(os.getenv("MCP_SMART_FETCH_TOP", "5"))
 SEMANTIC_CACHE_THRESHOLD = float(os.getenv("MCP_SEMANTIC_THRESHOLD", "0.6"))
+MIN_RELEVANCE_THRESHOLD = float(os.getenv("MCP_MIN_RELEVANCE", "0.0"))
+LANGUAGE_MISMATCH_THRESHOLD = float(os.getenv("MCP_LANG_MISMATCH", "0.3"))
 
 
 def normalize_text(text: str) -> str:
@@ -95,6 +97,54 @@ def relevance_score(title: str, snippet: str, query: str) -> float:
         score += 3.0
 
     return score
+
+
+def is_redirect_url(url: str) -> bool:
+    """Detect if URL is a search engine redirect/tracking link."""
+    redirect_patterns = [
+        r'bing\.com/ck/a\?',
+        r'bing\.com/ip/',
+        r'yandex\.com/click/',
+        r'yandex\.ru/click/',
+        r'baidu\.com/link\?',
+        r'search\.result\.redirect',
+    ]
+    for pattern in redirect_patterns:
+        if re.search(pattern, url, re.IGNORECASE):
+            return True
+    return False
+
+
+def detect_text_language(text: str) -> str:
+    """Detect language of text by character ranges. Returns 'ru', 'zh', 'en', or 'other'."""
+    if not text:
+        return "other"
+    ru_count = sum(1 for c in text if '\u0400' <= c <= '\u04FF')
+    zh_count = sum(1 for c in text if '\u4E00' <= c <= '\u9FFF')
+    latin_count = sum(1 for c in text if c.isascii() and c.isalpha())
+    total_alpha = ru_count + zh_count + latin_count
+    if total_alpha == 0:
+        return "other"
+    if ru_count / total_alpha > 0.5:
+        return "ru"
+    if zh_count / total_alpha > 0.5:
+        return "zh"
+    if latin_count / total_alpha > 0.5:
+        return "en"
+    return "other"
+
+
+def is_language_mismatch(query: str, title: str, snippet: str, threshold: float = 0.3) -> bool:
+    """Check if result language significantly differs from query language."""
+    query_lang = detect_language(query)
+    result_lang = detect_text_language(title + " " + snippet)
+    if query_lang == result_lang:
+        return False
+    if query_lang == "en" or result_lang == "en":
+        return False
+    if result_lang == "other":
+        return False
+    return True
 
 
 def semantic_cache_get(cache: _Cache, key: str, fallback_keys: Optional[List[str]] = None) -> Optional[str]:
@@ -486,13 +536,34 @@ async def web_search(query: str) -> List[str]:
             _tracker.record_call("search")
             return [f"No results found for query: {query}"]
 
-        # Score and sort by relevance
+        # Score, filter, and sort by relevance
         scored_results = []
         for title, url, snippet in results:
+            # Filter redirect/tracking URLs
+            if is_redirect_url(url):
+                logger.info("Filtered redirect URL: %s", url[:80])
+                continue
+
             score = relevance_score(title, snippet, query)
+
+            # Filter by relevance threshold
+            if score < MIN_RELEVANCE_THRESHOLD:
+                logger.info("Filtered low relevance (score=%.2f): %s", score, title[:60])
+                continue
+
+            # Filter language mismatches
+            if is_language_mismatch(query, title, snippet, LANGUAGE_MISMATCH_THRESHOLD):
+                logger.info("Filtered language mismatch: query_lang=%s result_lang=%s",
+                           detect_language(query), detect_text_language(title + " " + snippet))
+                continue
+
             scored_results.append((score, title, url, snippet))
 
         scored_results.sort(key=lambda x: x[0], reverse=True)
+
+        if not scored_results:
+            _tracker.record_call("search")
+            return [f"No relevant results found for query: {query}. All results were filtered by relevance, language, or redirect detection."]
 
         # Smart fetch: only fetch top-N most relevant results
         fetch_limit = min(SMART_FETCH_TOP_N, len(scored_results))
