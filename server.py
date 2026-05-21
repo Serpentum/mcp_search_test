@@ -7,7 +7,10 @@ import time
 import socket
 import json
 import ipaddress
-from typing import List
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from typing import List, Tuple, Optional
 from urllib.parse import urlparse, quote_plus
 
 from mcp.server.fastmcp import FastMCP
@@ -18,12 +21,102 @@ import trafilatura
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from playwright_stealth import Stealth
 
+# --- Language Detection & Engine Selection ---
+
+CYRILLIC_PATTERN = re.compile(r'[\u0400-\u04FF]')
+CHINESE_PATTERN = re.compile(r'[\u4E00-\u9FFF]')
+LATIN_ALPHA_PATTERN = re.compile(r'[a-zA-Z]{3,}')
+
+
+def detect_language(query: str) -> str:
+    """Detect query language and return 'ru', 'zh', or 'en'."""
+    if CYRILLIC_PATTERN.search(query):
+        return "ru"
+    if CHINESE_PATTERN.search(query):
+        return "zh"
+    if LATIN_ALPHA_PATTERN.search(query):
+        return "en"
+    return "en"
+
+
+# --- Engine Config ---
+
+# Default engine order (EN priority)
+DEFAULT_ENGINE_ORDER = ["bing", "yandex", "baidu"]
+
+# Engine priority by language
+ENGINE_BY_LANG = {
+    "ru": ["yandex", "bing", "baidu"],
+    "zh": ["baidu", "bing", "yandex"],
+    "en": ["bing", "yandex", "baidu"],
+}
+
+RESULTS_PER_ENGINE = int(os.getenv("MCP_RESULTS_PER_ENGINE", "12"))
+EARLY_TERMINATION_THRESHOLD = int(os.getenv("MCP_EARLY_TERM", "8"))
+BATCH_FETCH_SIZE = int(os.getenv("MCP_BATCH_FETCH", "4"))
+SMART_FETCH_TOP_N = int(os.getenv("MCP_SMART_FETCH_TOP", "3"))
+SEMANTIC_CACHE_THRESHOLD = float(os.getenv("MCP_SEMANTIC_THRESHOLD", "0.6"))
+
+
+def normalize_text(text: str) -> str:
+    """Normalize text for semantic comparison."""
+    text = text.lower().strip()
+    text = unicodedata.normalize('NFKD', text)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def semantic_similarity(a: str, b: str) -> float:
+    """Compute fuzzy similarity between two strings."""
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
+
+def relevance_score(title: str, snippet: str, query: str) -> float:
+    """Score how relevant a result is to the query (0-1)."""
+    q_words = set(normalize_text(query).split())
+    if not q_words:
+        return 0.0
+
+    title_norm = normalize_text(title)
+    snippet_norm = normalize_text(snippet)
+
+    score = 0.0
+    for word in q_words:
+        if word in title_norm:
+            score += 2.0
+        if word in snippet_norm:
+            score += 1.0
+
+    # Bonus for exact phrase match
+    if normalize_text(query) in normalize_text(title + " " + snippet):
+        score += 3.0
+
+    return score
+
+
+def semantic_cache_get(cache: _Cache, key: str, fallback_keys: Optional[List[str]] = None) -> Optional[str]:
+    """Try exact cache hit first, then try semantic match on fallback keys."""
+    exact = cache.get(key)
+    if exact is not None:
+        return exact
+
+    if fallback_keys:
+        for fk in fallback_keys:
+            cached_key = None
+            for stored_key in list(cache._store.keys()):
+                if stored_key.startswith("search:"):
+                    stored_query = stored_key[len("search:"):]
+                    if semantic_similarity(stored_query, fk) >= SEMANTIC_CACHE_THRESHOLD:
+                        cached_key = stored_key
+                        break
+            if cached_key:
+                logger.info("Semantic cache hit: '%s' matched '%s' (score=%.2f)", fk, stored_query,
+                            semantic_similarity(stored_query, fk))
+                return cache._store[cached_key].value
+    return None
+
 # --- Environment Config ---
-MAX_SEARCH_SOFT = int(os.getenv("MCP_MAX_SEARCH_SOFT", "5"))
-MAX_SEARCH_HARD = int(os.getenv("MCP_MAX_SEARCH_HARD", "7"))
-MAX_FETCH_SOFT = int(os.getenv("MCP_MAX_FETCH_SOFT", "8"))
-MAX_FETCH_HARD = int(os.getenv("MCP_MAX_FETCH_HARD", "10"))
-MAX_TOTAL_REQUESTS = int(os.getenv("MCP_MAX_TOTAL", "30"))
 CACHE_TTL_SECONDS = int(os.getenv("MCP_CACHE_TTL", "300"))
 CACHE_MAX_SIZE = int(os.getenv("MCP_CACHE_MAX_SIZE", "100"))
 UNSAFE_MODE = os.getenv("MCP_UNSAFE_MODE", "false").lower() == "true"
@@ -93,15 +186,6 @@ class SessionTracker:
         self.total_count = 0
         self.cache = _Cache()
 
-    def can_call(self, tool_type: str) -> bool:
-        if self.total_count >= MAX_TOTAL_REQUESTS:
-            return False
-        if tool_type == "search":
-            return self.search_count < MAX_SEARCH_HARD
-        if tool_type == "fetch":
-            return self.fetch_count < MAX_FETCH_HARD
-        return True
-
     def record_call(self, tool_type: str):
         self.total_count += 1
         if tool_type == "search":
@@ -113,65 +197,6 @@ class SessionTracker:
         self.search_count = 0
         self.fetch_count = 0
         self.total_count = 0
-
-    def get_progress(self) -> dict:
-        return {
-            "searches": self.search_count,
-            "searches_soft": MAX_SEARCH_SOFT,
-            "searches_hard": MAX_SEARCH_HARD,
-            "fetches": self.fetch_count,
-            "fetches_soft": MAX_FETCH_SOFT,
-            "fetches_hard": MAX_FETCH_HARD,
-            "total": self.total_count,
-            "total_hard": MAX_TOTAL_REQUESTS,
-            "remaining_searches": max(0, MAX_SEARCH_HARD - self.search_count),
-            "remaining_fetches": max(0, MAX_FETCH_HARD - self.fetch_count),
-            "remaining_total": max(0, MAX_TOTAL_REQUESTS - self.total_count),
-        }
-
-    def get_search_advisory(self) -> str | None:
-        if self.search_count >= MAX_SEARCH_HARD:
-            return None
-        if self.search_count >= MAX_SEARCH_SOFT:
-            remaining = MAX_SEARCH_HARD - self.search_count
-            if remaining == 1:
-                return (
-                    "\n---\n"
-                    "⚠️ Достигнут мягкий лимит поисков (5/7).\n"
-                    "Пожалуйста, завершите поиск и перейдите к суммаризации найденных данных.\n"
-                    "Прочитайте найденные страницы через fetch_url для углубления в тему."
-                )
-            else:
-                return (
-                    "\n---\n"
-                    f"⚠️ Достигнут мягкий лимит поисков ({self.search_count}/{MAX_SEARCH_HARD}).\n"
-                    f"Рекомендую: 1) Прочитать найденные страницы через fetch_url 2) "
-                    f"Сформировать ответ на основе имеющихся данных"
-                )
-        return None
-
-    def get_fetch_advisory(self) -> str | None:
-        if self.fetch_count >= MAX_FETCH_HARD:
-            return None
-        if self.fetch_count >= MAX_FETCH_SOFT:
-            return (
-                "\n---\n"
-                f"⚠️ Достигнут мягкий лимит чтений ({self.fetch_count}/{MAX_FETCH_HARD}).\n"
-                "Пожалуйста, завершите чтение и сформируйте ответ на основе имеющихся данных."
-            )
-        return None
-
-    def get_progress_banner(self) -> str:
-        p = self.get_progress()
-        return (
-            f"\n---\n"
-            f"📊 Прогресс: поиски {p['searches']}/{p['searches_hard']}, "
-            f"чтения {p['fetches']}/{p['fetches_hard']}, "
-            f"всего {p['total']}/{p['total_hard']}\n"
-            f"Осталось: {p['remaining_searches']} поисков, "
-            f"{p['remaining_fetches']} чтений, "
-            f"{p['remaining_total']} всего"
-        )
 
 
 _tracker = SessionTracker()
@@ -258,7 +283,7 @@ async def _parse_yandex(page: Page, query: str) -> list[tuple[str, str, str]]:
                 });
             }
         }
-        return results.slice(0, 5);
+        return results.slice(0, """ + str(RESULTS_PER_ENGINE) + """);
     }""")
 
     parsed = []
@@ -303,7 +328,7 @@ async def _parse_bing(page: Page, query: str) -> list[tuple[str, str, str]]:
                 });
             }
         }
-        return results.slice(0, 5);
+        return results.slice(0, """ + str(RESULTS_PER_ENGINE) + """);
     }""")
 
     parsed = []
@@ -346,7 +371,7 @@ async def _parse_baidu(page: Page, query: str) -> list[tuple[str, str, str]]:
                 const content = item.querySelector('.c-abstract, .content-2Ve07, .moia1Vr') || item;
                 const snippet = content.textContent.trim().substring(0, 200);
                 results.push({ title: title, url: href, snippet: snippet });
-                if (results.length >= 5) break;
+                if (results.length >= """ + str(RESULTS_PER_ENGINE) + """) break;
             }
         }
         return results;
@@ -362,110 +387,149 @@ async def _parse_baidu(page: Page, query: str) -> list[tuple[str, str, str]]:
     return parsed
 
 
-ENGINES = [
-    (_parse_bing, "Bing"),
-    (_parse_yandex, "Yandex"),
-    (_parse_baidu, "Baidu"),
-]
+ENGINES = {
+    "bing": (_parse_bing, "Bing"),
+    "yandex": (_parse_yandex, "Yandex"),
+    "baidu": (_parse_baidu, "Baidu"),
+}
 
 
 async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
-    """Search using all engines concurrently and merge results."""
-    async def search_engine(engine_func, engine_name):
+    """Search using language-aware engine selection with early termination."""
+    lang = detect_language(query)
+    engine_order = ENGINE_BY_LANG.get(lang, DEFAULT_ENGINE_ORDER)
+
+    all_results = []
+    seen_urls = set()
+
+    for engine_key in engine_order:
+        engine_func, engine_name = ENGINES[engine_key]
         page = await _browser.new_page()
         try:
             await Stealth().apply_stealth_async(page)
             results = await engine_func(page, query)
             if results:
-                logger.info("%s returned %d results", engine_name, len(results))
-            return results
+                logger.info("%s (lang=%s) returned %d results", engine_name, lang, len(results))
+
+                for title, url, snippet in results:
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        all_results.append((title, url, snippet))
+
+                if len(all_results) >= EARLY_TERMINATION_THRESHOLD:
+                    logger.info("Early termination: %d results collected", len(all_results))
+                    break
         except Exception as e:
             logger.warning("%s search failed: %s", engine_name, str(e))
-            return []
         finally:
             try:
                 await page.close()
             except Exception:
                 pass
 
-    tasks = [search_engine(engine_func, name) for engine_func, name in ENGINES]
-    results_list = await asyncio.gather(*tasks)
-
-    all_results = []
-    for results in results_list:
-        all_results.extend(results)
-
-    seen_urls = set()
-    unique_results = []
-    for title, url, snippet in all_results:
-        if url not in seen_urls:
-            seen_urls.add(url)
-            unique_results.append((title, url, snippet))
-
-    return unique_results
+    return all_results
 
 
 # --- web_search ---
 
 @app.tool()
 async def web_search(query: str) -> List[str]:
-    """Search the web via multiple search engines concurrently.
-    Soft limit: 5, Hard limit: 7 per session.
+    """Search the web via multiple search engines with smart fetch.
     
     Args:
         query: Search query string
         
     Returns:
-        List of up to 5 search results (title, URL, snippet)
+        List of search results with relevance scoring and top-N fetch
     """
     if not query or not query.strip():
         return ["Error: query parameter is required and cannot be empty."]
 
     query = query.strip()
 
-    cached = _tracker.cache.get(f"search:{query}")
+    # Check cache (exact + semantic)
+    cached = semantic_cache_get(_tracker.cache, f"search:{query}", fallback_keys=[query])
     if cached is not None:
         logger.info("web_search: cache hit for '%s'", query)
-        banner = _tracker.get_progress_banner()
-        return [*cached, banner]
+        return [*cached]
 
-    if not _tracker.can_call("search"):
-        logger.warning("Search hard limit reached (%d/%d)", _tracker.search_count, MAX_SEARCH_HARD)
-        return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_HARD}/{MAX_SEARCH_HARD}). Дальнейший поиск недоступен. Используйте已有的 результаты."]
+    logger.info("web_search: cache miss for '%s'", query)
 
     try:
         results = await _search_all_engines(query)
 
         if not results:
             _tracker.record_call("search")
-            banner = _tracker.get_progress_banner()
-            advisory = _tracker.get_search_advisory()
-            msg = f"No results found for query: {query}"
-            if advisory:
-                return [msg, advisory]
-            return [msg, banner]
+            return [f"No results found for query: {query}"]
 
-        formatted_results = []
-        for i, (title, url, snippet) in enumerate(results, 1):
-            formatted_results.append(
-                f"Result {i}:\n"
-                f"  Title: {title}\n"
-                f"  URL: {url}\n"
-                f"  Snippet: {snippet}\n"
-                f"{'-' * 40}"
-            )
+        # Score and sort by relevance
+        scored_results = []
+        for title, url, snippet in results:
+            score = relevance_score(title, snippet, query)
+            scored_results.append((score, title, url, snippet))
+
+        scored_results.sort(key=lambda x: x[0], reverse=True)
+
+        # Smart fetch: only fetch top-N most relevant results
+        fetch_limit = min(SMART_FETCH_TOP_N, len(scored_results))
+        top_results = scored_results[:fetch_limit]
+
+        # Batch fetch top results
+        fetched_contents = []
+        for i in range(0, len(top_results), BATCH_FETCH_SIZE):
+            batch = top_results[i:i + BATCH_FETCH_SIZE]
+
+            tasks = []
+            for score, title, url, snippet in batch:
+                tasks.append(fetch_url(url))
+
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for (score, title, url, snippet), content in zip(batch, batch_results):
+                if isinstance(content, Exception):
+                    logger.warning(f"Batch fetch failed for {url}: {content}")
+                    continue
+                if content and not content.startswith("Error") and not content.startswith("ERROR"):
+                    fetched_contents.append({
+                        "title": title,
+                        "url": url,
+                        "snippet": snippet,
+                        "content": content,
+                        "relevance_score": score
+                    })
+
+        # Format results
+        if not fetched_contents:
+            formatted_results = []
+            for i, (score, title, url, snippet) in enumerate(top_results, 1):
+                formatted_results.append(
+                    f"Result {i}:\n"
+                    f"  Title: {title}\n"
+                    f"  URL: {url}\n"
+                    f"  Snippet: {snippet}\n"
+                    f"  Relevance: {score:.2f}\n"
+                    f"{'-' * 40}"
+                )
+        else:
+            formatted_results = []
+            for i, item in enumerate(fetched_contents, 1):
+                formatted_results.append(
+                    f"Result {i}:\n"
+                    f"  Title: {item['title']}\n"
+                    f"  URL: {item['url']}\n"
+                    f"  Snippet: {item['snippet']}\n"
+                    f"  Relevance: {item['relevance_score']:.2f}\n"
+                    f"  Content:\n{item['content'][:800]}\n"
+                    f"{'-' * 40}"
+                )
 
         _tracker.record_call("search")
         _tracker.cache.put(f"search:{query}", formatted_results)
 
-        logger.info("web_search: %d results (call %d/%d)", len(results), _tracker.search_count, MAX_SEARCH_HARD)
+        logger.info("web_search: %d results, %d fetched",
+                    len(top_results), len(fetched_contents))
 
-        banner = _tracker.get_progress_banner()
-        advisory = _tracker.get_search_advisory()
-
-        if advisory:
-            return [*formatted_results, advisory]
-        return [*formatted_results, banner]
+        return formatted_results
 
     except Exception as e:
         logger.error("web_search error: %s", str(e), exc_info=True)
@@ -476,7 +540,7 @@ async def web_search(query: str) -> List[str]:
 
 @app.tool()
 async def fetch_url(url: str, format: str = "markdown") -> str:
-    """Fetch page content from a URL. Soft limit: 8, Hard limit: 10 per session.
+    """Fetch page content from a URL.
     
     Args:
         url: URL to fetch (http:// or https://)
@@ -496,12 +560,7 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
     cached = _tracker.cache.get(f"fetch:{url}:{fmt}")
     if cached is not None:
         logger.info("fetch_url: cache hit for '%s' (%s)", url, fmt)
-        banner = _tracker.get_progress_banner()
-        return f"{cached}\n{banner}"
-
-    if not _tracker.can_call("fetch"):
-        logger.warning("Fetch hard limit reached (%d/%d)", _tracker.fetch_count, MAX_FETCH_HARD)
-        return f"ERROR: Лимит чтений исчерпан ({MAX_FETCH_HARD}/{MAX_FETCH_HARD}). Дальнейшее чтение невозможно. Используйте已有的 результаты."
+        return cached
 
     try:
         headers = {
@@ -521,13 +580,8 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
                 content = response.text[:10000]
                 _tracker.record_call("fetch")
                 _tracker.cache.put(f"fetch:{url}:{fmt}", content)
-                logger.info("fetch_url: HTML %d chars (call %d/%d)", len(content), _tracker.fetch_count, MAX_FETCH_HARD)
-                banner = _tracker.get_progress_banner()
-                advisory = _tracker.get_fetch_advisory()
-                result = f"{content}\n{banner}"
-                if advisory:
-                    result = f"{content}\n{advisory}"
-                return result
+                logger.info("fetch_url: HTML %d chars", len(content))
+                return content
 
             try:
                 markdown = trafilatura.extract(
@@ -551,14 +605,8 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
 
         _tracker.record_call("fetch")
         _tracker.cache.put(f"fetch:{url}:{fmt}", content)
-        logger.info("fetch_url: %d chars (call %d/%d)", len(content), _tracker.fetch_count, MAX_FETCH_HARD)
-
-        banner = _tracker.get_progress_banner()
-        advisory = _tracker.get_fetch_advisory()
-
-        if advisory:
-            return f"{content}\n{advisory}"
-        return f"{content}\n{banner}"
+        logger.info("fetch_url: %d chars", len(content))
+        return content
 
     except httpx.RequestError as e:
         logger.error("fetch_url network error: %s", str(e), exc_info=True)
@@ -570,22 +618,6 @@ async def fetch_url(url: str, format: str = "markdown") -> str:
         logger.error("fetch_url error: %s", str(e), exc_info=True)
         return f"Error fetching '{url}': {str(e)}"
 
-
-@app.tool()
-def reset_limits() -> str:
-    """Reset all search and fetch counters. Use when starting a new task or conversation.
-    
-    Returns:
-        Confirmation message with current limits
-    """
-    _tracker.reset()
-    logger.info("Limits reset by user")
-    return (
-        f"Лимиты сброшены.\n"
-        f"Поиски: {MAX_SEARCH_SOFT} (мягкий) / {MAX_SEARCH_HARD} (жёсткий)\n"
-        f"Чтения: {MAX_FETCH_SOFT} (мягкий) / {MAX_FETCH_HARD} (жёсткий)\n"
-        f"Всего: {MAX_TOTAL_REQUESTS}"
-    )
 
 
 # --- URL Validation ---
