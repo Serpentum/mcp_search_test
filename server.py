@@ -16,6 +16,7 @@ import httpx
 from bs4 import BeautifulSoup
 import trafilatura
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright_stealth import Stealth
 
 # --- Environment Config ---
 MAX_SEARCH_SOFT = int(os.getenv("MCP_MAX_SEARCH_SOFT", "5"))
@@ -407,15 +408,16 @@ async def _parse_rambler(page: Page, query: str) -> list[tuple[str, str, str]]:
 async def _search_with_fallback(query: str) -> list[tuple[str, str, str]]:
     """Try search engines in order: Google -> Bing -> Yandex -> Rambler."""
     engines = [
+        ("bing", _parse_bing),
         ("google", _parse_google),
-        # ("bing", _parse_bing),
-        # ("yandex", _parse_yandex),
-        # ("rambler", _parse_rambler),
+        ("yandex", _parse_yandex),
+        ("rambler", _parse_rambler),
     ]
 
     for name, engine_fn in engines:
         try:
             page = await _browser.new_page()
+            await Stealth().apply_stealth_async(page)
             results = await engine_fn(page, query)
             await page.close()
             if results:
