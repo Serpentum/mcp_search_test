@@ -371,11 +371,10 @@ ENGINES = [
 
 async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
     """Search using all engines concurrently and merge results."""
-    page = await _browser.new_page()
-    await Stealth().apply_stealth_async(page)
-
     async def search_engine(engine_func, engine_name):
+        page = await _browser.new_page()
         try:
+            await Stealth().apply_stealth_async(page)
             results = await engine_func(page, query)
             if results:
                 logger.info("%s returned %d results", engine_name, len(results))
@@ -383,6 +382,11 @@ async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
         except Exception as e:
             logger.warning("%s search failed: %s", engine_name, str(e))
             return []
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     tasks = [search_engine(engine_func, name) for engine_func, name in ENGINES]
     results_list = await asyncio.gather(*tasks)
