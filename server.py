@@ -54,7 +54,7 @@ ENGINE_BY_LANG = {
 RESULTS_PER_ENGINE = int(os.getenv("MCP_RESULTS_PER_ENGINE", "12"))
 EARLY_TERMINATION_THRESHOLD = int(os.getenv("MCP_EARLY_TERM", "8"))
 BATCH_FETCH_SIZE = int(os.getenv("MCP_BATCH_FETCH", "4"))
-SMART_FETCH_TOP_N = int(os.getenv("MCP_SMART_FETCH_TOP", "3"))
+SMART_FETCH_TOP_N = int(os.getenv("MCP_SMART_FETCH_TOP", "5"))
 SEMANTIC_CACHE_THRESHOLD = float(os.getenv("MCP_SEMANTIC_THRESHOLD", "0.6"))
 
 
@@ -268,23 +268,23 @@ async def _parse_yandex(page: Page, query: str) -> list[tuple[str, str, str]]:
         logger.warning("yandex: navigation error: %s", str(e))
         return []
 
-    results = await page.evaluate("""() => {
+    results = await page.evaluate(f"""() => {{
         const items = document.querySelectorAll('.serp-item');
         const results = [];
-        for (const item of items) {
+        for (const item of items) {{
             const titleEl = item.querySelector('.serp-item__title a, a[href]');
             const linkEl = item.querySelector('.path__text, .link');
             const snippetEl = item.querySelector('.serp-item__text, .serp-item__snippet, .organic__text');
-            if (titleEl && titleEl.href) {
-                results.push({
+            if (titleEl && titleEl.href) {{
+                results.push({{
                     title: titleEl.textContent.trim(),
                     url: titleEl.href,
                     snippet: snippetEl ? snippetEl.textContent.trim() : ''
-                });
-            }
-        }
-        return results.slice(0, """ + str(RESULTS_PER_ENGINE) + """);
-    }""")
+                }});
+            }}
+        }}
+        return results.slice(0, {RESULTS_PER_ENGINE});
+    }}""")
 
     parsed = []
     for r in results:
@@ -314,22 +314,22 @@ async def _parse_bing(page: Page, query: str) -> list[tuple[str, str, str]]:
         logger.warning("bing: navigation error: %s", str(e))
         return []
 
-    results = await page.evaluate("""() => {
+    results = await page.evaluate(f"""() => {{
         const items = document.querySelectorAll('.b_algo');
         const results = [];
-        for (const item of items) {
+        for (const item of items) {{
             const titleEl = item.querySelector('h2 a');
             const snippetEl = item.querySelector('.b_caption p, p');
-            if (titleEl && titleEl.href) {
-                results.push({
+            if (titleEl && titleEl.href) {{
+                results.push({{
                     title: titleEl.textContent.trim(),
                     url: titleEl.href,
                     snippet: snippetEl ? snippetEl.textContent.trim() : ''
-                });
-            }
-        }
-        return results.slice(0, """ + str(RESULTS_PER_ENGINE) + """);
-    }""")
+                }});
+            }}
+        }}
+        return results.slice(0, {RESULTS_PER_ENGINE});
+    }}""")
 
     parsed = []
     for r in results:
@@ -357,25 +357,25 @@ async def _parse_baidu(page: Page, query: str) -> list[tuple[str, str, str]]:
         logger.warning("baidu: navigation error: %s", str(e))
         return []
 
-    results = await page.evaluate("""() => {
+    results = await page.evaluate(f"""() => {{
         const items = document.querySelectorAll('.result, .result-op, .c-container');
         const results = [];
         const seen = new Set();
-        for (const item of items) {
+        for (const item of items) {{
             const link = item.querySelector('a');
             if (!link) continue;
             const href = link.href || '';
-            if (href && !seen.has(href)) {
+            if (href && !seen.has(href)) {{
                 seen.add(href);
                 const title = link.textContent.trim();
                 const content = item.querySelector('.c-abstract, .content-2Ve07, .moia1Vr') || item;
                 const snippet = content.textContent.trim().substring(0, 200);
-                results.push({ title: title, url: href, snippet: snippet });
-                if (results.length >= """ + str(RESULTS_PER_ENGINE) + """) break;
-            }
-        }
+                results.push({{ title: title, url: href, snippet: snippet }});
+                if (results.length >= {RESULTS_PER_ENGINE}) break;
+            }}
+        }}
         return results;
-    }""")
+    }}""")
 
     parsed = []
     for r in results:
@@ -401,8 +401,9 @@ async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
 
     all_results = []
     seen_urls = set()
+    early_stop = asyncio.Event()
 
-    for engine_key in engine_order:
+    async def run_engine(engine_key: str) -> list[tuple[str, str, str]]:
         engine_func, engine_name = ENGINES[engine_key]
         page = await _browser.new_page()
         try:
@@ -418,7 +419,7 @@ async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
 
                 if len(all_results) >= EARLY_TERMINATION_THRESHOLD:
                     logger.info("Early termination: %d results collected", len(all_results))
-                    break
+                    early_stop.set()
         except Exception as e:
             logger.warning("%s search failed: %s", engine_name, str(e))
         finally:
@@ -426,6 +427,10 @@ async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
                 await page.close()
             except Exception:
                 pass
+        return []
+
+    tasks = [run_engine(engine_key) for engine_key in engine_order]
+    await asyncio.gather(*tasks)
 
     return all_results
 
@@ -534,6 +539,18 @@ async def web_search(query: str) -> List[str]:
     except Exception as e:
         logger.error("web_search error: %s", str(e), exc_info=True)
         return [f"Error searching for '{query}': {str(e)}"]
+
+
+@app.tool()
+async def reset_session() -> List[str]:
+    """Reset session counters and clear the cache.
+    
+    Returns:
+        Confirmation message with reset counters
+    """
+    _tracker.reset()
+    logger.info("Session reset: all counters cleared")
+    return ["Session reset: search_count=0, fetch_count=0, total_count=0"]
 
 
 # --- fetch_url ---
