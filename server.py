@@ -405,10 +405,12 @@ async def _parse_rambler(page: Page, query: str) -> list[tuple[str, str, str]]:
 # --- Search Fallback Chain ---
 
 async def _search_with_fallback(query: str) -> list[tuple[str, str, str]]:
-    """Try search engines in order: Google -> Bing."""
+    """Try search engines in order: Google -> Bing -> Yandex -> Rambler."""
     engines = [
         ("google", _parse_google),
         ("bing", _parse_bing),
+        ("yandex", _parse_yandex),
+        ("rambler", _parse_rambler),
     ]
 
     for name, engine_fn in engines:
