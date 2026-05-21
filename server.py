@@ -99,9 +99,9 @@ def relevance_score(title: str, snippet: str, query: str) -> float:
     return score
 
 
-def is_redirect_url(url: str) -> bool:
-    """Detect if URL is a search engine redirect/tracking link."""
-    redirect_patterns = [
+_REDIRECT_URL_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
         r'bing\.com/ck/a\?',
         r'bing\.com/ip/',
         r'yandex\.com/click/',
@@ -109,16 +109,25 @@ def is_redirect_url(url: str) -> bool:
         r'baidu\.com/link\?',
         r'search\.result\.redirect',
     ]
-    for pattern in redirect_patterns:
-        if re.search(pattern, url, re.IGNORECASE):
-            return True
-    return False
+]
+
+
+def is_redirect_url(url: str) -> bool:
+    """Detect if URL is a search engine redirect/tracking link."""
+    return any(p.search(url) for p in _REDIRECT_URL_PATTERNS)
+
+
+_URL_PATTERN = re.compile(r'https?://[^\s<>)"]+')
 
 
 def detect_text_language(text: str) -> str:
-    """Detect language of text by character ranges. Returns 'ru', 'zh', 'en', or 'other'."""
+    """Detect language of text by character ranges. Returns 'ru', 'zh', 'en', or 'other'.
+    
+    URLs are stripped before analysis to avoid false positives from ASCII hostnames.
+    """
     if not text:
         return "other"
+    text = _URL_PATTERN.sub(' ', text)
     ru_count = sum(1 for c in text if '\u0400' <= c <= '\u04FF')
     zh_count = sum(1 for c in text if '\u4E00' <= c <= '\u9FFF')
     latin_count = sum(1 for c in text if c.isascii() and c.isalpha())
@@ -135,16 +144,27 @@ def detect_text_language(text: str) -> str:
 
 
 def is_language_mismatch(query: str, title: str, snippet: str, threshold: float = 0.3) -> bool:
-    """Check if result language significantly differs from query language."""
+    """Check if result language significantly differs from query language.
+    
+    Returns True if the result should be filtered out due to language mismatch.
+    threshold > 0.0 enables filtering; threshold == 0.0 disables it.
+    """
     query_lang = detect_language(query)
     result_lang = detect_text_language(title + " " + snippet)
+
+    # Same language — always keep
     if query_lang == result_lang:
         return False
-    if query_lang == "en" or result_lang == "en":
-        return False
+
+    # Unknown/other language — keep (don't over-filter)
     if result_lang == "other":
         return False
-    return True
+
+    # Non-English mismatch — filter if threshold is enabled
+    if threshold > 0.0 and query_lang != "en" and result_lang != "en":
+        return True
+
+    return False
 
 
 def semantic_cache_get(cache: _Cache, key: str, fallback_keys: Optional[List[str]] = None) -> Optional[str]:
