@@ -94,45 +94,62 @@ MCP_MAX_SEARCH_SOFT=3 MCP_MAX_TOTAL=20 python server.py
 
 Сервер использует протокол MCP (JSON-RPC через stdin/stdout).
 
-### Claude Desktop
+### macOS (Homebrew Python)
 
-Добавьте конфигурацию в `claude_desktop_config.json`:
+На macOS с Homebrew Python требуется использование виртуального окружения:
 
 ```json
 {
   "mcpServers": {
     "web-tools": {
-      "command": "python",
+      "command": "/path/to/mcp_search_test/.venv/bin/python",
       "args": ["/path/to/mcp_search_test/server.py"],
       "env": {
-        "MCP_MAX_SEARCH_SOFT": "5",
-        "MCP_MAX_SEARCH_HARD": "7",
-        "MCP_MAX_FETCH_SOFT": "8",
-        "MCP_MAX_FETCH_HARD": "10",
-        "MCP_MAX_TOTAL": "30",
-        "MCP_CACHE_TTL": "300",
-        "MCP_CACHE_MAX_SIZE": "100",
-        "MCP_UNSAFE_MODE": "false"
+        "MCP_UNSAFE_MODE": "true"
       }
     }
   }
 }
 ```
 
-### Cursor / VS Code / другие клиенты
+### Claude Desktop
 
-Аналогичная JSON-конфигурация с `command` и `args`:
+Путь к конфигу: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ```json
 {
   "mcpServers": {
     "web-tools": {
-      "command": "python",
-      "args": ["/path/to/mcp_search_test/server.py"]
+      "command": "/path/to/mcp_search_test/.venv/bin/python",
+      "args": ["/path/to/mcp_search_test/server.py"],
+      "env": {
+        "MCP_UNSAFE_MODE": "true"
+      }
     }
   }
 }
 ```
+
+### Cursor / VS Code / Chatbox / другие MCP-клиенты
+
+Аналогичная JSON-конфигурация:
+
+```json
+{
+  "mcpServers": {
+    "web-tools": {
+      "command": "/path/to/mcp_search_test/.venv/bin/python",
+      "args": ["/path/to/mcp_search_test/server.py"],
+      "env": {
+        "MCP_UNSAFE_MODE": "true"
+      }
+    }
+  }
+}
+```
+
+> **Важно:** Замените `/path/to/mcp_search_test` на реальный путь к проекту.
+> `MCP_UNSAFE_MODE=true` отключает проверки безопасности URL — используйте только если доверяете загружаемым страницам.
 
 ## Примеры вызовов
 
