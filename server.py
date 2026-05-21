@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 import httpx
 from bs4 import BeautifulSoup
 import trafilatura
-from duckduckgo_search import DDGS
+from brave import AsyncBrave
 
 # --- Environment Config ---
 MAX_SEARCH_SOFT = int(os.getenv("MCP_MAX_SEARCH_SOFT", "5"))
@@ -278,12 +278,13 @@ async def web_search(query: str) -> List[str]:
 
     try:
         results = []
-        with DDGS() as ddgs:
-            for item in ddgs.text(query, max_results=5):
-                title = item.get('title', 'No title')
-                url = item.get('href', '')
-                snippet = item.get('body', 'No snippet')
-                results.append((title, url, snippet))
+        brave = AsyncBrave()
+        search_results = await brave.search(q=query, count=5)
+        for item in search_results.web_results:
+            title = item.title or 'No title'
+            url = item.url or ''
+            snippet = item.description or 'No snippet'
+            results.append((title, url, snippet))
 
         if not results:
             _tracker.record_call("search")

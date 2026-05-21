@@ -1,12 +1,12 @@
 ﻿# MCP Web Tools
 
-MCP-сервер с инструментами для поиска в интернете и загрузки содержимого веб-страниц. Использует DuckDuckGo для поиска и извлекает текст страниц в markdown-формате.
+MCP-сервер с инструментами для поиска в интернете и загрузки содержимого веб-страниц. Использует Brave Search для поиска и извлекает текст страниц в markdown-формате.
 
 ## Инструменты
 
 | Инструмент | Описание | Аргументы |
 |------------|----------|-----------|
-| `web_search` | Поиск в интернете через DuckDuckGo (до 5 результатов: заголовок, URL, сниппет) | `query` (str) — текст запроса |
+| `web_search` | Поиск в интернете через Brave Search (до 5 результатов: заголовок, URL, сниппет) | `query` (str) — текст запроса |
 | `fetch_url` | Загрузка содержимого веб-страницы, извлечение текста в markdown или HTML | `url` (str) — URL страницы, `format` (str) — `markdown` (по умолчанию) или `html` |
 | `reset_limits` | Сброс всех счётчиков вызовов для начала новой задачи | нет |
 
@@ -74,6 +74,7 @@ pip install -r requirements.txt
 | `MCP_CACHE_TTL` | `300` | Время жизни кэша в секундах (5 минут) |
 | `MCP_CACHE_MAX_SIZE` | `100` | Максимальное количество записей в кэше (LRU eviction) |
 | `MCP_UNSAFE_MODE` | `false` | Отключает все проверки безопасности URL (localhost, частные IP). Используйте только в изолированных средах |
+| `BRAVE_API_KEY` | — | API-ключ для Brave Search (получить на https://brave.com/search/api/) |
 
 ### Запуск
 
@@ -111,7 +112,8 @@ MCP_MAX_SEARCH_SOFT=3 MCP_MAX_TOTAL=20 python server.py
         "MCP_MAX_TOTAL": "30",
         "MCP_CACHE_TTL": "300",
         "MCP_CACHE_MAX_SIZE": "100",
-        "MCP_UNSAFE_MODE": "false"
+        "MCP_UNSAFE_MODE": "false",
+        "BRAVE_API_KEY": "your-brave-api-key-here"
       }
     }
   }
@@ -183,4 +185,4 @@ MCP_MAX_SEARCH_SOFT=3 MCP_MAX_TOTAL=20 python server.py
 | `httpx>=0.27.0` | Асинхронный HTTP-клиент |
 | `beautifulsoup4>=4.12.0` | Парсинг HTML (fallback) |
 | `trafilatura>=1.6.0` | Извлечение текста страниц в markdown |
-| `duckduckgo-search>=5.0` | Поиск через DuckDuckGo |
+| `brave-search>=0.2.0` | Поиск через Brave Search |
