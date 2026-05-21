@@ -149,7 +149,7 @@ MCP_MAX_SEARCH_SOFT=3 MCP_MAX_TOTAL=20 python server.py
 ```
 
 > **Важно:** Замените `/path/to/mcp_search_test` на реальный путь к проекту.
-> `MCP_UNSAFE_MODE=true` отключает проверки безопасности URL — используйте только если доверяете загружаемым страницам.
+> `MCP_UNSAFE_MODE=true` разрешает доступ к localhost и частным IP-адресам — нужно для локальных сервисов.
 
 ## Примеры вызовов
 
@@ -191,7 +191,7 @@ MCP_MAX_SEARCH_SOFT=3 MCP_MAX_TOTAL=20 python server.py
 - Блокировка localhost и частных IP-адресов (10.x, 172.16–31.x, 192.168.x, 127.x, link-local, IPv6 private/loopback)
 - Лимит вывода 10 000 символов для `fetch_url`
 - Логирование ошибок в stderr
-- `MCP_UNSAFE_MODE=true` отключает все проверки безопасности (только для изолированных сред)
+- `MCP_UNSAFE_MODE=true` разрешает доступ к localhost и частным IP-адресам
 
 ## Зависимости
 
