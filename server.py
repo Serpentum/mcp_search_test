@@ -275,48 +275,6 @@ async def _parse_yandex(page: Page, query: str) -> list[tuple[str, str, str]]:
     return parsed
 
 
-async def _parse_google(page: Page, query: str) -> list[tuple[str, str, str]]:
-    """Search via Google."""
-    url = f"https://www.google.com/search?q={quote_plus(query)}&hl=ru&num=5"
-    logger.info("google: navigating to %s", url)
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
-        try:
-            await page.wait_for_selector("div.g", timeout=10000)
-        except Exception:
-            pass
-    except Exception as e:
-        logger.warning("google: navigation error: %s", str(e))
-        return []
-
-    results = await page.evaluate("""() => {
-        const items = document.querySelectorAll('div.g a, div.MjjYud a');
-        const results = [];
-        const seen = new Set();
-        for (const item of items) {
-            const href = item.href || '';
-            if (href && !href.includes('google.') && !seen.has(href)) {
-                seen.add(href);
-                const title = item.textContent.trim();
-                const parent = item.closest('div');
-                const snippet = parent ? parent.querySelector('span[style]')?.textContent.trim() || '' : '';
-                results.push({ title: title, url: href, snippet: snippet });
-                if (results.length >= 5) break;
-            }
-        }
-        return results;
-    }""")
-
-    parsed = []
-    for r in results:
-        title = r.get("title", "").strip()
-        url = r.get("url", "").strip()
-        snippet = r.get("snippet", "").strip()
-        if title and url:
-            parsed.append((title, url, snippet))
-    return parsed
-
-
 async def _parse_bing(page: Page, query: str) -> list[tuple[str, str, str]]:
     """Search via Bing."""
     url = f"https://www.bing.com/search?q={quote_plus(query)}&setlang=ru&count=5"
@@ -360,35 +318,38 @@ async def _parse_bing(page: Page, query: str) -> list[tuple[str, str, str]]:
     return parsed
 
 
-async def _parse_rambler(page: Page, query: str) -> list[tuple[str, str, str]]:
-    """Search via Rambler."""
-    url = f"https://search.rambler.ru/search?query={quote_plus(query)}"
-    logger.info("rambler: navigating to %s", url)
+async def _parse_baidu(page: Page, query: str) -> list[tuple[str, str, str]]:
+    """Search via Baidu."""
+    url = f"https://www.baidu.com/s?wd={quote_plus(query)}&rn=5"
+    logger.info("baidu: navigating to %s", url)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
         try:
-            await page.wait_for_selector(".result", timeout=10000)
+            await page.wait_for_selector(".result, .result-op", timeout=10000)
         except Exception:
             pass
     except Exception as e:
-        logger.warning("rambler: navigation error: %s", str(e))
+        logger.warning("baidu: navigation error: %s", str(e))
         return []
 
     results = await page.evaluate("""() => {
-        const items = document.querySelectorAll('.result');
+        const items = document.querySelectorAll('.result, .result-op, .c-container');
         const results = [];
+        const seen = new Set();
         for (const item of items) {
-            const titleEl = item.querySelector('.result__title__link, a[href]');
-            const snippetEl = item.querySelector('.result__snippet, .item__text, .snippet');
-            if (titleEl && titleEl.href) {
-                results.push({
-                    title: titleEl.textContent.trim(),
-                    url: titleEl.href,
-                    snippet: snippetEl ? snippetEl.textContent.trim() : ''
-                });
+            const link = item.querySelector('a');
+            if (!link) continue;
+            const href = link.href || '';
+            if (href && !seen.has(href)) {
+                seen.add(href);
+                const title = link.textContent.trim();
+                const content = item.querySelector('.c-abstract, .content-2Ve07, .moia1Vr') || item;
+                const snippet = content.textContent.trim().substring(0, 200);
+                results.push({ title: title, url: href, snippet: snippet });
+                if (results.length >= 5) break;
             }
         }
-        return results.slice(0, 5);
+        return results;
     }""")
 
     parsed = []
@@ -397,49 +358,54 @@ async def _parse_rambler(page: Page, query: str) -> list[tuple[str, str, str]]:
         url = r.get("url", "").strip()
         snippet = r.get("snippet", "").strip()
         if title and url:
-            if url.startswith("//"):
-                url = "https:" + url
             parsed.append((title, url, snippet))
     return parsed
 
 
-# --- Search Fallback Chain ---
+ENGINES = [
+    (_parse_bing, "Bing"),
+    (_parse_yandex, "Yandex"),
+    (_parse_baidu, "Baidu"),
+]
 
-async def _search_with_fallback(query: str) -> list[tuple[str, str, str]]:
-    """Try search engines in order: Google -> Bing -> Yandex -> Rambler."""
-    engines = [
-        ("bing", _parse_bing),
-        ("google", _parse_google),
-        ("yandex", _parse_yandex),
-        ("rambler", _parse_rambler),
-    ]
 
-    for name, engine_fn in engines:
+async def _search_all_engines(query: str) -> list[tuple[str, str, str]]:
+    """Search using all engines concurrently and merge results."""
+    page = await _browser.new_page()
+    await Stealth().apply_stealth_async(page)
+
+    async def search_engine(engine_func, engine_name):
         try:
-            page = await _browser.new_page()
-            await Stealth().apply_stealth_async(page)
-            results = await engine_fn(page, query)
-            await page.close()
+            results = await engine_func(page, query)
             if results:
-                logger.info("search: %s returned %d results", name, len(results))
-                return results
-            logger.info("search: %s returned 0 results, trying next engine", name)
+                logger.info("%s returned %d results", engine_name, len(results))
+            return results
         except Exception as e:
-            logger.warning("search: %s failed: %s", name, str(e))
-            try:
-                await page.close()
-            except Exception:
-                pass
+            logger.warning("%s search failed: %s", engine_name, str(e))
+            return []
 
-    logger.warning("search: all engines failed for query '%s'", query)
-    return []
+    tasks = [search_engine(engine_func, name) for engine_func, name in ENGINES]
+    results_list = await asyncio.gather(*tasks)
+
+    all_results = []
+    for results in results_list:
+        all_results.extend(results)
+
+    seen_urls = set()
+    unique_results = []
+    for title, url, snippet in all_results:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique_results.append((title, url, snippet))
+
+    return unique_results
 
 
 # --- web_search ---
 
 @app.tool()
 async def web_search(query: str) -> List[str]:
-    """Search the web via search engines (Yandex, Google, Bing, Rambler).
+    """Search the web via multiple search engines concurrently.
     Soft limit: 5, Hard limit: 7 per session.
     
     Args:
@@ -464,7 +430,7 @@ async def web_search(query: str) -> List[str]:
         return [f"ERROR: Лимит поисков исчерпан ({MAX_SEARCH_HARD}/{MAX_SEARCH_HARD}). Дальнейший поиск недоступен. Используйте已有的 результаты."]
 
     try:
-        results = await _search_with_fallback(query)
+        results = await _search_all_engines(query)
 
         if not results:
             _tracker.record_call("search")
